@@ -1,0 +1,182 @@
+{
+  "openapi": "3.0.1",
+  "info": {
+    "title": "Orders API",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/api/orders/cancel": {
+      "put": {
+        "summary": "Cancel an Order",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-requestid",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true,
+            "description": "Request identifier"
+          }
+        ],
+        "requestBody": {
+          "description": "Cancel Order Command",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Order canceled successfully"
+          },
+          "400": {
+            "description": "Invalid request or empty GUID"
+          },
+          "default": {
+            "description": "Unexpected error"
+          }
+        }
+      }
+    },
+    "/api/orders/ship": {
+      "put": {
+        "summary": "Ship an Order",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-requestid",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true,
+            "description": "Request identifier"
+          }
+        ],
+        "requestBody": {
+          "description": "Ship Order Command",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Order shipped successfully"
+          },
+          "400": {
+            "description": "Invalid request or empty GUID"
+          },
+          "default": {
+            "description": "Unexpected error"
+          }
+        }
+      }
+    },
+    "/api/orders/{orderId}": {
+      "get": {
+        "summary": "Get Order by ID",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "orderId",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true,
+            "description": "Order ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Order details returned"
+          },
+          "404": {
+            "description": "Order not found"
+          }
+        }
+      }
+    },
+    "/api/orders/": {
+      "get": {
+        "summary": "Get Orders for the current user",
+        "responses": {
+          "200": {
+            "description": "List of orders returned"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create an Order",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-requestid",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true,
+            "description": "Request identifier"
+          }
+        ],
+        "requestBody": {
+          "description": "Create Order Request",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Order created successfully"
+          },
+          "400": {
+            "description": "Bad request"
+          }
+        }
+      }
+    },
+    "/api/orders/cardtypes": {
+      "get": {
+        "summary": "Get Card Types",
+        "responses": {
+          "200": {
+            "description": "List of card types returned"
+          }
+        }
+      }
+    },
+    "/api/orders/draft": {
+      "post": {
+        "summary": "Create Order Draft",
+        "requestBody": {
+          "description": "Create Order Draft Command",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Order draft created successfully"
+          }
+        }
+      }
+    }
+  }
+}
