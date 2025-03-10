@@ -124,6 +124,16 @@ public sealed class CatalogApiTests : IClassFixture<CatalogApiFixture>
     }
 
     [Fact]
+    public async Task GetCatalogItemWithNonExistingId()
+    {
+        // Act
+        var response = await _httpClient.GetAsync("/api/catalog/items/999");
+        
+        // Assert
+        Assert.Equal("NotFound", response.StatusCode.ToString());
+    }
+
+    [Fact]
     public async Task GetCatalogItemWithExactName()
     {
         // Act

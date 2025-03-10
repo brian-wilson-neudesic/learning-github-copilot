@@ -34,6 +34,8 @@ public class Order
 
     public int? PaymentId { get; private set; }
 
+    public decimal Taxes { get; private set; }
+
     public static Order NewDraft()
     {
         var order = new Order
@@ -182,5 +184,10 @@ public class Order
         throw new OrderingDomainException($"Is not possible to change the order status from {OrderStatus} to {orderStatusToChange}.");
     }
 
-    public decimal GetTotal() => _orderItems.Sum(o => o.Units * o.UnitPrice);
+    public decimal GetTotal()
+    {
+        var total = _orderItems.Sum(o => o.Units * o.UnitPrice);
+        var totalDiscount = _orderItems.Sum(o => o.Discount);
+        return total + Taxes - totalDiscount;
+    }
 }
