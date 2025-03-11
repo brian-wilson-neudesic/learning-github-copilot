@@ -1,0 +1,106 @@
+name: Build and Push Ordering.API Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      imageTag:
+        description: 'Docker image tag'
+        required: true
+        default: 'latest'
+      buildConfiguration:
+        description: 'Build configuration'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+      targetEnvironment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/Ordering.API/**'
+      - '.github/workflows/ordering-api-build-image.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/Ordering.API/**'
+
+env:
+  REGISTRY_NAME: ${{ secrets.ACR_REGISTRY_NAME }}
+  REPOSITORY: ordering-api
+  IMAGE_NAME: ${{ secrets.ACR_REGISTRY_NAME }}/ordering-api
+  DOCKERFILE_PATH: src/Ordering.API/Dockerfile
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY_NAME }}.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Determine image tag
+        id: determine-tag
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "IMAGE_TAG=${{ github.event.inputs.imageTag }}" >> $GITHUB_ENV
+            echo "BUILD_CONFIG=${{ github.event.inputs.buildConfiguration }}" >> $GITHUB_ENV
+          else
+            SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
+            echo "IMAGE_TAG=${SHORT_SHA}" >> $GITHUB_ENV
+            echo "BUILD_CONFIG=Release" >> $GITHUB_ENV
+          fi
+
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE_PATH }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.REPOSITORY }}:${{ env.IMAGE_TAG }}
+            ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.REPOSITORY }}:latest
+          build-args: |
+            BUILD_CONFIGURATION=${{ env.BUILD_CONFIG }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      - name: Log image information
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "Published Docker image: ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          echo "Build configuration: ${{ env.BUILD_CONFIG }}"
+          echo "Target environment: ${{ github.event.inputs.targetEnvironment || 'default' }}"

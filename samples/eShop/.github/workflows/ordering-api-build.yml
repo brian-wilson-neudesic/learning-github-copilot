@@ -1,0 +1,88 @@
+name: Ordering API Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build'
+        required: true
+        default: 'main'
+        type: string
+      build_configuration:
+        description: 'Build configuration'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Debug
+          - Release
+      run_tests:
+        description: 'Run tests'
+        required: true
+        default: true
+        type: boolean
+      publish_artifacts:
+        description: 'Publish artifacts'
+        required: true
+        default: true
+        type: boolean
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/Ordering.API/**'
+      - '.github/workflows/ordering-api-build.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/Ordering.API/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    env:
+      BRANCH_NAME: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.ref_name }}
+      BUILD_CONFIGURATION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build_configuration || 'Release' }}
+      RUN_TESTS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_tests || 'true' }}
+      PUBLISH_ARTIFACTS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_artifacts || (github.event_name != 'pull_request' && 'true' || 'false') }}
+      PROJECT_PATH: src/Ordering.API/Ordering.API.csproj
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ env.BRANCH_NAME }}
+    
+    - name: Display build information
+      run: |
+        echo "Building branch: ${{ env.BRANCH_NAME }}"
+        echo "Configuration: ${{ env.BUILD_CONFIGURATION }}"
+        echo "Run tests: ${{ env.RUN_TESTS }}"
+        echo "Publish artifacts: ${{ env.PUBLISH_ARTIFACTS }}"
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '9.0.x'
+        
+    - name: Restore dependencies
+      run: dotnet restore ${{ env.PROJECT_PATH }}
+      
+    - name: Build
+      run: dotnet build ${{ env.PROJECT_PATH }} --no-restore --configuration ${{ env.BUILD_CONFIGURATION }}
+      
+    - name: Test
+      if: ${{ env.RUN_TESTS == 'true' }}
+      run: dotnet test ${{ env.PROJECT_PATH }} --no-build --configuration ${{ env.BUILD_CONFIGURATION }} --verbosity normal
+      
+    - name: Publish
+      if: ${{ env.PUBLISH_ARTIFACTS == 'true' }}
+      run: dotnet publish ${{ env.PROJECT_PATH }} --configuration ${{ env.BUILD_CONFIGURATION }} --output ./publish
+      
+    - name: Upload artifacts
+      if: ${{ env.PUBLISH_ARTIFACTS == 'true' }}
+      uses: actions/upload-artifact@v3
+      with:
+        name: ordering-api-${{ env.BUILD_CONFIGURATION }}-${{ github.run_id }}
+        path: ./publish
+        retention-days: 7

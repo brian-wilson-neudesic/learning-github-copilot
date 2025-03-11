@@ -1,0 +1,514 @@
+name: Deploy Ordering API to Azure App Service
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'samples/eShop/src/Ordering.API/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'samples/eShop/src/Ordering.API/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      azure_region:
+        description: 'Azure region for deployment'
+        required: true
+        default: 'westus2'
+        type: choice
+        options:
+          - westus2
+          - eastus
+          - northeurope
+          - westeurope
+      service_plan_tier:
+        description: 'App Service Plan tier'
+        required: true
+        default: 'Basic'
+        type: choice
+        options:
+          - Free
+          - Shared
+          - Basic
+          - Standard
+          - Premium
+          - PremiumV2
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Set up .NET Core
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '9.0.x'
+      
+      - name: Install security tools
+        run: |
+          dotnet tool install --global dotnet-security-scanner
+          dotnet tool install --global dotnet-sonarscanner
+          
+      - name: Run SAST Analysis with SonarCloud
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          dotnet sonarscanner begin /k:"ordering-api" /o:"${{ github.repository_owner }}" /d:sonar.login="${{ secrets.SONAR_TOKEN }}" /d:sonar.host.url="https://sonarcloud.io"
+          dotnet build "./samples/eShop/src/Ordering.API" --configuration Release
+          dotnet sonarscanner end /d:sonar.login="${{ secrets.SONAR_TOKEN }}"
+      
+      - name: Run Dependency Vulnerability Check
+        run: |
+          dotnet restore "./samples/eShop/src/Ordering.API"
+          dotnet security-scan "./samples/eShop/src/Ordering.API"
+      
+      - name: Run OWASP ZAP Scan on API Definition
+        uses: zaproxy/action-baseline@v0.7.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          docker_name: 'owasp/zap2docker-stable'
+          target: 'https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/samples/eShop/src/Ordering.API/swagger.json'
+          rules_file_name: '.github/workflows/zap-rules.tsv'
+          cmd_options: '-a'
+
+  build:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Set up .NET Core
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '9.0.x'
+      
+      - name: Build with dotnet
+        run: dotnet build "./samples/eShop/src/Ordering.API" --configuration Release
+      
+      - name: Publish with dotnet
+        run: dotnet publish "./samples/eShop/src/Ordering.API" --configuration Release --output ./publish
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: app-artifact
+          path: ./publish
+
+  deploy-dev:
+    if: github.event.inputs.environment == 'dev' || github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+    
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: app-artifact
+          path: ./publish
+          
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Create or update App Service Plan
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az appservice plan create --name ${{ secrets.DEV_APP_SERVICE_PLAN }} \
+              --resource-group ${{ secrets.DEV_RESOURCE_GROUP }} \
+              --location ${{ github.event.inputs.azure_region || 'westus2' }} \
+              --sku ${{ github.event.inputs.service_plan_tier || 'Basic' }} \
+              --is-linux
+
+      - name: Deploy to Azure Web App
+        id: deploy-to-webapp
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ secrets.DEV_APP_SERVICE_NAME }}
+          slot-name: 'dev-slot'
+          publish-profile: ${{ secrets.DEV_PUBLISH_PROFILE }}
+          package: ./publish
+          
+      - name: Configure App Settings
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az webapp config appsettings set --name ${{ secrets.DEV_APP_SERVICE_NAME }} \
+              --resource-group ${{ secrets.DEV_RESOURCE_GROUP }} \
+              --slot dev-slot \
+              --settings \
+                ASPNETCORE_ENVIRONMENT=Development \
+                LogLevel__Default=Information \
+                ${{ secrets.DEV_APP_SETTINGS }}
+
+      - name: Configure SSL Settings
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            # Enable HTTPS Only
+            az webapp update --name ${{ secrets.DEV_APP_SERVICE_NAME }} \
+              --resource-group ${{ secrets.DEV_RESOURCE_GROUP }} \
+              --slot dev-slot \
+              --https-only true
+            
+            # Set TLS version to 1.2
+            az webapp config set --name ${{ secrets.DEV_APP_SERVICE_NAME }} \
+              --resource-group ${{ secrets.DEV_RESOURCE_GROUP }} \
+              --slot dev-slot \
+              --min-tls-version 1.2
+
+      - name: Configure IP Restrictions
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            # Allow only specific IPs for dev environment
+            az webapp config access-restriction set --name ${{ secrets.DEV_APP_SERVICE_NAME }} \
+              --resource-group ${{ secrets.DEV_RESOURCE_GROUP }} \
+              --slot dev-slot \
+              --rule-name 'Allow-Dev-Office' \
+              --action Allow \
+              --ip-address ${{ secrets.DEV_ALLOWED_IPS }} \
+              --priority 100
+
+      - name: Swap slots
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az webapp deployment slot swap --name ${{ secrets.DEV_APP_SERVICE_NAME }} \
+              --resource-group ${{ secrets.DEV_RESOURCE_GROUP }} \
+              --slot dev-slot \
+              --target-slot production
+
+      - name: Azure logout
+        run: az logout
+        if: always()
+
+  deploy-staging:
+    if: github.event.inputs.environment == 'staging'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+    
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: app-artifact
+          path: ./publish
+          
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Create or update App Service Plan
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az appservice plan create --name ${{ secrets.STAGING_APP_SERVICE_PLAN }} \
+              --resource-group ${{ secrets.STAGING_RESOURCE_GROUP }} \
+              --location ${{ github.event.inputs.azure_region || 'westus2' }} \
+              --sku ${{ github.event.inputs.service_plan_tier || 'Standard' }} \
+              --is-linux
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ secrets.STAGING_APP_SERVICE_NAME }}
+          slot-name: 'staging-slot'
+          publish-profile: ${{ secrets.STAGING_PUBLISH_PROFILE }}
+          package: ./publish
+          
+      - name: Configure App Settings
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az webapp config appsettings set --name ${{ secrets.STAGING_APP_SERVICE_NAME }} \
+              --resource-group ${{ secrets.STAGING_RESOURCE_GROUP }} \
+              --slot staging-slot \
+              --settings \
+                ASPNETCORE_ENVIRONMENT=Staging \
+                LogLevel__Default=Warning \
+                ${{ secrets.STAGING_APP_SETTINGS }}
+
+      - name: Configure SSL Settings
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            # Upload custom SSL certificate if provided
+            if [ -n "${{ secrets.STAGING_SSL_CERTIFICATE }}" ] && [ -n "${{ secrets.STAGING_SSL_CERTIFICATE_PASSWORD }}" ]; then
+              # Save certificate to file
+              echo "${{ secrets.STAGING_SSL_CERTIFICATE }}" | base64 -d > staging_cert.pfx
+              
+              # Bind the certificate
+              az webapp config ssl upload --certificate-file staging_cert.pfx \
+                --certificate-password "${{ secrets.STAGING_SSL_CERTIFICATE_PASSWORD }}" \
+                --name ${{ secrets.STAGING_APP_SERVICE_NAME }} \
+                --resource-group ${{ secrets.STAGING_RESOURCE_GROUP }}
+              
+              # Delete the local certificate file
+              rm staging_cert.pfx
+            fi
+            
+            # Enable HTTPS Only
+            az webapp update --name ${{ secrets.STAGING_APP_SERVICE_NAME }} \
+              --resource-group ${{ secrets.STAGING_RESOURCE_GROUP }} \
+              --slot staging-slot \
+              --https-only true
+            
+            # Set TLS version to 1.2
+            az webapp config set --name ${{ secrets.STAGING_APP_SERVICE_NAME }} \
+              --resource-group ${{ secrets.STAGING_RESOURCE_GROUP }} \
+              --slot staging-slot \
+              --min-tls-version 1.2
+
+      - name: Configure IP Restrictions
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            # Set IP restrictions for staging
+            az webapp config access-restriction set --name ${{ secrets.STAGING_APP_SERVICE_NAME }} \
+              --resource-group ${{ secrets.STAGING_RESOURCE_GROUP }} \
+              --slot staging-slot \
+              --rule-name 'Allow-Company-Network' \
+              --action Allow \
+              --ip-address ${{ secrets.STAGING_ALLOWED_IPS }} \
+              --priority 100
+            
+            # Add VNET integration if specified
+            if [ -n "${{ secrets.STAGING_VNET_NAME }}" ] && [ -n "${{ secrets.STAGING_SUBNET_NAME }}" ]; then
+              az webapp vnet-integration add --name ${{ secrets.STAGING_APP_SERVICE_NAME }} \
+                --resource-group ${{ secrets.STAGING_RESOURCE_GROUP }} \
+                --slot staging-slot \
+                --vnet ${{ secrets.STAGING_VNET_NAME }} \
+                --subnet ${{ secrets.STAGING_SUBNET_NAME }}
+            fi
+
+      - name: Run Security Scan on Deployed App
+        run: |
+          echo "Running OWASP ZAP scan against deployed staging app..."
+          # Add security scan commands here
+
+      - name: Swap slots
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az webapp deployment slot swap --name ${{ secrets.STAGING_APP_SERVICE_NAME }} \
+              --resource-group ${{ secrets.STAGING_RESOURCE_GROUP }} \
+              --slot staging-slot \
+              --target-slot production
+
+      - name: Azure logout
+        run: az logout
+        if: always()
+
+  deploy-prod:
+    if: github.event.inputs.environment == 'prod'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: prod
+      url: ${{ steps.deploy-to-webapp-prod.outputs.webapp-url }}
+    
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: app-artifact
+          path: ./publish
+          
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Create or update App Service Plan
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az appservice plan create --name ${{ secrets.PROD_APP_SERVICE_PLAN }} \
+              --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} \
+              --location ${{ github.event.inputs.azure_region || 'westus2' }} \
+              --sku ${{ github.event.inputs.service_plan_tier || 'PremiumV2' }} \
+              --is-linux
+
+      - name: Deploy to Azure Web App Staging Slot
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ secrets.PROD_APP_SERVICE_NAME }}
+          slot-name: 'staging'
+          publish-profile: ${{ secrets.PROD_PUBLISH_PROFILE }}
+          package: ./publish
+          
+      - name: Configure App Settings
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az webapp config appsettings set --name ${{ secrets.PROD_APP_SERVICE_NAME }} \
+              --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} \
+              --slot staging \
+              --settings \
+                ASPNETCORE_ENVIRONMENT=Production \
+                LogLevel__Default=Error \
+                ${{ secrets.PROD_APP_SETTINGS }}
+
+      - name: Configure SSL with Azure Managed Certificate
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            # Enable managed certificate for custom domains
+            for domain in $(echo ${{ secrets.PROD_CUSTOM_DOMAINS }} | tr ',' '\n'); do
+              # Add custom domain
+              az webapp config hostname add --webapp-name ${{ secrets.PROD_APP_SERVICE_NAME }} \
+                --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} \
+                --slot staging \
+                --hostname $domain
+              
+              # Create and bind managed certificate
+              az webapp config ssl create --name ${{ secrets.PROD_APP_SERVICE_NAME }} \
+                --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} \
+                --slot staging \
+                --hostname $domain
+            done
+            
+            # Upload custom SSL certificate if provided
+            if [ -n "${{ secrets.PROD_SSL_CERTIFICATE }}" ] && [ -n "${{ secrets.PROD_SSL_CERTIFICATE_PASSWORD }}" ]; then
+              # Save certificate to file
+              echo "${{ secrets.PROD_SSL_CERTIFICATE }}" | base64 -d > prod_cert.pfx
+              
+              # Bind the certificate
+              az webapp config ssl upload --certificate-file prod_cert.pfx \
+                --certificate-password "${{ secrets.PROD_SSL_CERTIFICATE_PASSWORD }}" \
+                --name ${{ secrets.PROD_APP_SERVICE_NAME }} \
+                --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} \
+                --slot staging
+              
+              # Delete the local certificate file
+              rm prod_cert.pfx
+            fi
+            
+            # Enable HTTPS Only and enforce TLS 1.2
+            az webapp update --name ${{ secrets.PROD_APP_SERVICE_NAME }} \
+              --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} \
+              --slot staging \
+              --https-only true
+            
+            az webapp config set --name ${{ secrets.PROD_APP_SERVICE_NAME }} \
+              --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} \
+              --slot staging \
+              --min-tls-version 1.2
+
+      - name: Configure Web Application Firewall
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            # Check if Front Door exists, create if not
+            frontDoorExists=$(az network front-door list --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} --query "[?name=='${{ secrets.PROD_FRONTDOOR_NAME }}']" -o tsv)
+            if [ -z "$frontDoorExists" ]; then
+              az network front-door create --name ${{ secrets.PROD_FRONTDOOR_NAME }} \
+                --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} \
+                --backend-address "${{ secrets.PROD_APP_SERVICE_NAME }}.azurewebsites.net" \
+                --accepted-protocols Http Https \
+                --forwarding-protocol HttpsOnly
+            fi
+            
+            # Enable WAF policy
+            az network front-door waf-policy create --name ${{ secrets.PROD_WAF_POLICY_NAME }} \
+              --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} \
+              --mode Prevention \
+              --sku Standard_AzureFrontDoor
+
+      - name: Configure IP Restrictions
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            # Set strict IP restrictions for production
+            az webapp config access-restriction set --name ${{ secrets.PROD_APP_SERVICE_NAME }} \
+              --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} \
+              --slot staging \
+              --rule-name 'Allow-Production' \
+              --action Allow \
+              --ip-address ${{ secrets.PROD_ALLOWED_IPS }} \
+              --priority 100
+            
+            # Add Front Door service tag if Front Door is configured
+            if [ -n "${{ secrets.PROD_FRONTDOOR_NAME }}" ]; then
+              az webapp config access-restriction add --name ${{ secrets.PROD_APP_SERVICE_NAME }} \
+                --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} \
+                --slot staging \
+                --rule-name 'Allow-FrontDoor' \
+                --action Allow \
+                --service-tag AzureFrontDoor.Backend \
+                --priority 200
+            fi
+            
+            # Add VNET integration if specified
+            if [ -n "${{ secrets.PROD_VNET_NAME }}" ] && [ -n "${{ secrets.PROD_SUBNET_NAME }}" ]; then
+              az webapp vnet-integration add --name ${{ secrets.PROD_APP_SERVICE_NAME }} \
+                --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} \
+                --slot staging \
+                --vnet ${{ secrets.PROD_VNET_NAME }} \
+                --subnet ${{ secrets.PROD_SUBNET_NAME }}
+            fi
+
+      - name: Run Integration Tests against Staging Slot
+        run: |
+          echo "Running tests against staging slot before promoting to production..."
+          # Add integration test commands here
+
+      - name: Run Security Compliance Scan
+        run: |
+          echo "Running security compliance scan for production readiness..."
+          # Add security compliance scan commands here
+
+      - name: Swap slots after approval
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az webapp deployment slot swap --name ${{ secrets.PROD_APP_SERVICE_NAME }} \
+              --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} \
+              --slot staging \
+              --target-slot production
+
+      - name: Get production webapp URL
+        id: deploy-to-webapp-prod
+        run: |
+          URL=$(az webapp show --name ${{ secrets.PROD_APP_SERVICE_NAME }} --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} --query "defaultHostName" -o tsv)
+          echo "webapp-url=https://$URL" >> $GITHUB_OUTPUT
+
+      - name: Configure Azure App Insights
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az monitor app-insights component create --app ${{ secrets.PROD_APP_SERVICE_NAME }} \
+              --location ${{ github.event.inputs.azure_region || 'westus2' }} \
+              --resource-group ${{ secrets.PROD_RESOURCE_GROUP }} \
+              --application-type web
+
+      - name: Azure logout
+        run: az logout
+        if: always()
+
+permissions:
+  contents: read
+  id-token: write

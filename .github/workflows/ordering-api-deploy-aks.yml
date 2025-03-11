@@ -1,0 +1,100 @@
+name: Ordering API Deploy to AKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      aks_cluster_name:
+        description: 'AKS Cluster Name'
+        required: true
+        type: string
+      resource_group:
+        description: 'Azure Resource Group'
+        required: true
+        type: string
+      namespace:
+        description: 'Kubernetes namespace'
+        required: true
+        default: 'default'
+        type: string
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      deployment_method:
+        description: 'Deployment method: manifest or helm'
+        required: true
+        default: 'manifest'
+        type: choice
+        options:
+          - manifest
+          - helm
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Set AKS Context
+      run: |
+        az aks get-credentials --resource-group "${{ inputs.resource_group }}" --name "${{ inputs.aks_cluster_name }}" --overwrite-existing
+
+    - name: Deploy with Manifests
+      if: ${{ inputs.deployment_method == 'manifest' }}
+      run: |
+        echo "Deploying Kubernetes manifests to namespace ${{ inputs.namespace }}"
+        kubectl apply -f k8s/ -n "${{ inputs.namespace }}"
+
+    - name: Deploy with Helm Chart
+      if: ${{ inputs.deployment_method == 'helm' }}
+      run: |
+        echo "Deploying Helm chart for Ordering.API to namespace ${{ inputs.namespace }}"
+        # Assumes a Helm chart exists under helm/ordering-api
+        helm upgrade --install ordering-api helm/ordering-api --namespace "${{ inputs.namespace }}" --create-namespace
+
+    - name: Wait for Deployment rollout
+      run: |
+        kubectl rollout status deployment/ordering-api -n "${{ inputs.namespace }}" --timeout=120s
+
+    - name: Health Check and Rollback
+      run: |
+        echo "Performing health check on the ordering-api service..."
+        POD=$(kubectl get pods -n "${{ inputs.namespace }}" -l app=ordering-api -o jsonpath="{.items[0].metadata.name}")
+        SUCCESS=0
+        for i in {1..12}; do
+          STATUS=$(kubectl exec -n "${{ inputs.namespace }}" "$POD" -- curl -s -o /dev/null -w "%{http_code}" http://localhost/health || echo "000")
+          echo "Health check attempt $i returned status $STATUS"
+          if [ "$STATUS" -eq "200" ]; then
+            echo "Health check successful."
+            SUCCESS=1
+            break
+          fi
+          sleep 10
+        done
+        if [ $SUCCESS -eq 0 ]; then
+          echo "Health check failed. Initiating rollback..."
+          if [ "${{ inputs.deployment_method }}" == "manifest" ]; then
+            kubectl rollout undo deployment/ordering-api -n "${{ inputs.namespace }}"
+          elif [ "${{ inputs.deployment_method }}" == "helm" ]; then
+            helm rollback ordering-api
+          fi
+          exit 1
+        fi
+
+    - name: Notify Azure Monitor
+      run: |
+        echo "Sending deployment event to Azure Monitor..."
+        # Replace the following with your actual Azure Monitor integration commands.
+        az monitor metrics list --resource "${{ inputs.aks_cluster_name }}" || echo "Azure Monitor integration failed."
